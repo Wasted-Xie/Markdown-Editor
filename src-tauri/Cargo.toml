@@ -17,6 +17,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
+# 仅 Linux 剪贴板实现需要：把文件路径编码成 file:// URI
+percent-encoding = "2"
 
 [profile.dev]
 incremental = true

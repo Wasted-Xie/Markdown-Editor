@@ -10,6 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tauri::State;
 
+// 仅 Linux 剪贴板实现使用
+#[cfg(target_os = "linux")]
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
+
 /// 允许打开的文本文件扩展名（Markdown 优先，附带少量纯文本格式）。
 const TEXT_EXTS: &[&str] = &[
     "md", "markdown", "mdown", "mkd", "mdx", "txt", "text", "log", "json", "yml", "yaml", "toml",
@@ -444,7 +448,17 @@ $data.SetFileDropList($files)
         Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let uris = paths
+            .iter()
+            .map(|p| path_to_file_uri(p))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        linux_clipboard_write(&uris, cut)
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
     {
         let _ = cut;
         Err("当前平台暂不支持写入系统剪贴板".to_string())
@@ -466,7 +480,12 @@ if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) { [Console]::Out.W
             .unwrap_or(false)
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_clipboard_has_uri_list()
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
     {
         false
     }
@@ -646,9 +665,165 @@ foreach ($f in $files) { $lines += $f }
         .collect())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn read_clipboard_files() -> Result<Vec<String>, String> {
+    let out = run_shell(
+        r#"if command -v wl-paste >/dev/null 2>&1; then
+  wl-paste --no-newline --type text/uri-list 2>/dev/null
+elif command -v xclip >/dev/null 2>&1; then
+  xclip -selection clipboard -t text/uri-list -o 2>/dev/null
+fi"#,
+    )?;
+
+    Ok(out.lines().filter_map(parse_file_uri).collect())
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
 fn read_clipboard_files() -> Result<Vec<String>, String> {
     Err("当前平台暂不支持读取系统剪贴板".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Linux 剪贴板实现
+// ---------------------------------------------------------------------------
+//
+// 不用 arboard 之类的 crate：它们对「文件列表」（text/uri-list）支持不完整，
+// 而我们的复制/粘贴需要与文件管理器互通。
+// 改用系统命令，行为确定、便于自查：
+//   Wayland -> wl-copy / wl-paste（包 wl-clipboard）
+//   X11     -> xclip
+// 两者都不在时给出可操作的安装提示，而不是静默失败。
+
+/// 把绝对路径编码成 `file://` URI（RFC 8089），非 ASCII 与空格走百分号编码。
+#[cfg(target_os = "linux")]
+fn path_to_file_uri(path: &str) -> Result<String, String> {
+    if !path.starts_with('/') {
+        return Err(format!("剪贴板需要绝对路径：{path}"));
+    }
+
+    const KEEP: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}');
+
+    Ok(format!("file://{}", utf8_percent_encode(path, KEEP)))
+}
+
+/// 从 `file://` URI 还原为本地路径；非 file 协议或非法 UTF-8 时返回 None。
+#[cfg(target_os = "linux")]
+fn parse_file_uri(uri: &str) -> Option<String> {
+    let trimmed = uri.trim();
+    let rest = trimmed.strip_prefix("file://")?;
+    // 形如 file://host/path 时，host 非空但不是 localhost 的按不支持处理
+    let path = match rest.find('/') {
+        Some(0) => rest,
+        Some(idx) => {
+            let host = &rest[..idx];
+            if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+                &rest[idx..]
+            } else {
+                return None;
+            }
+        }
+        None => return None,
+    };
+
+    percent_decode_str(path)
+        .decode_utf8()
+        .ok()
+        .map(|s| s.into_owned())
+}
+
+/// 检测可用的剪贴板工具。
+#[cfg(target_os = "linux")]
+fn linux_clipboard_tool() -> Result<&'static str, String> {
+    let out = run_shell(
+        r#"if command -v wl-copy >/dev/null 2>&1; then echo wayland
+elif command -v xclip >/dev/null 2>&1; then echo x11
+fi"#,
+    )?;
+
+    match out.trim() {
+        "wayland" => Ok("wayland"),
+        "x11" => Ok("x11"),
+        _ => Err(
+            "系统剪贴板不可用：请安装 wl-clipboard（Wayland）或 xclip（X11）。\n\
+             例如：sudo dnf install wl-clipboard   或   sudo apt install wl-clipboard"
+                .to_string(),
+        ),
+    }
+}
+
+/// 把 URI 列表写入系统剪贴板。
+///
+/// `cut` 用 `x-special/gnome-copied-files` 的 cut/copy 首行表达；
+/// 该类型仅 GNOME 系文件管理器识别，其它环境会忽略这一行、只当作普通复制。
+#[cfg(target_os = "linux")]
+fn linux_clipboard_write(uris: &[String], cut: bool) -> Result<(), String> {
+    let tool = linux_clipboard_tool()?;
+    let op = if cut { "cut" } else { "copy" };
+    let plain = uris.join("\n");
+    let gnome = format!("{op}\n{}", uris.join("\n"));
+
+    // 注意：脚本整体用单引号包裹，其中的 $ 不会被 PowerShell 之类的层解释；
+    // 这里由 sh 执行，$ 是有意保留的变量/命令替换。
+    let script = match tool {
+        "wayland" => format!(
+            r#"set -e
+printf '%s' '{plain}' | wl-copy --type text/uri-list
+printf '%s' '{plain}' | wl-copy --type text/plain
+printf '%s' '{gnome}' | wl-copy --type x-special/gnome-copied-files"#
+        ),
+        _ => format!(
+            r#"set -e
+printf '%s' '{plain}' | xclip -selection clipboard -t text/uri-list
+printf '%s' '{gnome}' | xclip -selection clipboard -t x-special/gnome-copied-files"#
+        ),
+    };
+
+    run_shell(&script)?;
+    Ok(())
+}
+
+/// 剪贴板里是否含文件列表（text/uri-list）。
+#[cfg(target_os = "linux")]
+fn linux_clipboard_has_uri_list() -> bool {
+    let script = r#"if command -v wl-paste >/dev/null 2>&1; then
+  wl-paste --list-types 2>/dev/null
+elif command -v xclip >/dev/null 2>&1; then
+  xclip -selection clipboard -t TARGETS -o 2>/dev/null
+fi"#;
+
+    run_shell(script)
+        .map(|out| out.contains("text/uri-list"))
+        .unwrap_or(false)
+}
+
+/// 用 sh 执行一段脚本，返回 stdout（UTF-8 解码）。
+///
+/// 为 Wayland 会话补齐环境变量：应用可能由 systemd 或桌面项启动，
+/// 而剪贴板工具需要 `XDG_RUNTIME_DIR` 才能连上合成器。
+#[cfg(target_os = "linux")]
+fn run_shell(script: &str) -> Result<String, String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .map_err(|e| format!("执行 sh 失败：{e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("剪贴板命令失败：{}", err.trim()));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// 执行一段 PowerShell 脚本，返回其 stdout（按 UTF-8 解码）。
@@ -829,7 +1004,8 @@ fn ensure_inside_root(path: &str, state: &State<'_, WorkspaceState>) -> Result<(
         target == root_norm || target.starts_with(&format!("{root_norm}/"))
     };
 
-    #[cfg(not(windows))]
+    // Linux 与 macOS 共用这条：路径大小写敏感，用 starts_with 更严谨
+    #[cfg(unix)]
     let inside = Path::new(path).starts_with(&root);
 
     if inside {
@@ -863,7 +1039,6 @@ fn system_time_ms(t: SystemTime) -> Option<u64> {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
-
     /// 与前端 `listDirsInfo` 相同的版本号算法
     fn dir_version(dir: &Path) -> String {
         let info = list_dirs_info(vec![normalize(dir)])
@@ -1102,5 +1277,92 @@ $data.SetData('Preferred DropEffect', [byte[]](5,0,0,0))
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// Linux 剪贴板的 URI 编解码测试。
+///
+/// 这些测试只在 Linux 上编译运行（`cargo test --lib`），
+/// 因为它们依赖的 `path_to_file_uri` / `parse_file_uri` 是 Linux 专用实现。
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn uri_encodes_ascii_path() {
+        assert_eq!(
+            path_to_file_uri("/home/u/a.md").unwrap(),
+            "file:///home/u/a.md"
+        );
+    }
+
+    #[test]
+    fn uri_encodes_space_and_non_ascii() {
+        let uri = path_to_file_uri("/home/u/功能 演示.md").unwrap();
+        assert!(uri.starts_with("file:///home/u/"), "uri={uri}");
+        // 空格与中文都必须被百分号编码
+        assert!(uri.contains("%20"), "空格未编码: {uri}");
+        assert!(!uri.contains(' '), "残留空格: {uri}");
+        assert!(uri.is_ascii(), "含未编码的非 ASCII: {uri}");
+    }
+
+    #[test]
+    fn uri_encodes_special_chars() {
+        let uri = path_to_file_uri("/tmp/a#b%c?d.md").unwrap();
+        assert!(uri.contains("%23"), "# 未编码: {uri}");
+        assert!(uri.contains("%25"), "% 未编码: {uri}");
+        assert!(uri.contains("%3F"), "? 未编码: {uri}");
+    }
+
+    #[test]
+    fn uri_requires_absolute_path() {
+        assert!(path_to_file_uri("relative/a.md").is_err());
+    }
+
+    #[test]
+    fn uri_roundtrips_ascii() {
+        let path = "/home/u/a.md";
+        let uri = path_to_file_uri(path).unwrap();
+        assert_eq!(parse_file_uri(&uri).as_deref(), Some(path));
+    }
+
+    #[test]
+    fn uri_roundtrips_non_ascii_with_spaces() {
+        // 中文 + 空格：这是最容易出问题的一类路径
+        let path = "/home/u/中文 目录/功能 演示.md";
+        let uri = path_to_file_uri(path).unwrap();
+        assert_eq!(
+            parse_file_uri(&uri).as_deref(),
+            Some(path),
+            "往返后路径不一致，uri={uri}"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_localhost_authority() {
+        assert_eq!(
+            parse_file_uri("file://localhost/tmp/a.md").as_deref(),
+            Some("/tmp/a.md")
+        );
+    }
+
+    #[test]
+    fn parse_rejects_foreign_authority() {
+        assert!(parse_file_uri("file://server/share/a.md").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_non_file_scheme() {
+        assert!(parse_file_uri("http://example.com/a").is_none());
+        assert!(parse_file_uri("/tmp/a.md").is_none());
+        assert!(parse_file_uri("").is_none());
+    }
+
+    #[test]
+    fn parse_ignores_blank_lines() {
+        // 剪贴板内容常带尾随换行，解析结果里不应出现空项
+        let raw = "file:///tmp/a.md\n\nfile:///tmp/b.md\n";
+        let parsed: Vec<String> = raw.lines().filter_map(parse_file_uri).collect();
+        assert_eq!(parsed, vec!["/tmp/a.md", "/tmp/b.md"]);
     }
 }
