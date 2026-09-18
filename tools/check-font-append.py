@@ -24,17 +24,44 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "main"
 FILES = ["src/styles.css", "src/renderer.ts"]
 
 
+def split_names(segment: str) -> list[str]:
+    """把一段字体声明切成字体名列表。
+
+    兼容两种写法：
+      CSS  `"Segoe UI", "Microsoft YaHei", system-ui, sans-serif`
+      TS   '"Segoe UI", "Microsoft YaHei", ' + 'system-ui, sans-serif'
+    """
+    cleaned = segment.replace("'", '"').replace("+", " ")
+    names: list[str] = []
+    for token in cleaned.split(","):
+        # 去掉引号与空白：字体名本身不含引号，直接剔除最稳
+        token = token.replace('"', "").strip()
+        if token and token not in {"system", "ui"}:
+            names.append(token)
+    return names
+
+
 def extract_stacks(text: str) -> list[list[str]]:
     """提取 CSS font-family 与 JS fontFamily 声明中的字体名列表。"""
-    stacks = []
-    for pattern in (r"font-family:\s*([^;]+);", r"fontFamily:\s*((?:'[^']*'|\s|\+)+)"):
-        for match in re.finditer(pattern, text):
-            names = re.findall(r'"([^"]+)"|\'([^\']+)\'|([A-Za-z][\w-]*)', match.group(1))
-            stack = [a or b or c for a, b, c in names]
-            # 过滤掉 JS 里的变量名/换行残留
-            stack = [s for s in stack if s and s not in {"system", "ui"}]
-            if stack:
-                stacks.append(stack)
+    stacks: list[list[str]] = []
+
+    # CSS: font-family: ... ;
+    for match in re.finditer(r"font-family:\s*([^;]+);", text):
+        names = split_names(match.group(1))
+        if names:
+            stacks.append(names)
+
+    # TS: fontFamily: 后面可能跨多行并用 + 拼接，取到下一个属性名为止
+    for match in re.finditer(
+        r"fontFamily:\s*((?:[^;}\n]|\n(?!\s*[a-zA-Z]+\s*:))*?)"
+        r"(?=,\s*\n\s*[a-zA-Z]+\s*:|\n\s*[a-zA-Z]+\s*:|\n\s*\})",
+        text,
+        re.S,
+    ):
+        names = split_names(match.group(1))
+        if names:
+            stacks.append(names)
+
     return stacks
 
 
