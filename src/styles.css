@@ -59,8 +59,9 @@ body,
 }
 
 body {
-  font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui,
-    -apple-system, sans-serif;
+  font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC",
+    "Source Han Sans SC", "WenQuanYi Micro Hei", system-ui, -apple-system,
+    sans-serif;
   font-size: 14px;
   color: var(--fg);
   background: var(--bg);
@@ -404,8 +405,8 @@ body {
 }
 
 .editor-host .cm-scroller {
-  font-family: "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New",
-    "Microsoft YaHei", monospace;
+  font-family: "Cascadia Mono", "JetBrains Mono", Consolas, "DejaVu Sans Mono",
+    "Noto Sans Mono", "Courier New", "Microsoft YaHei", monospace;
   font-size: var(--editor-font-size, 15px);
   line-height: 1.72;
   padding: 14px 4px 45vh 0;
@@ -592,7 +593,7 @@ body {
 kbd {
   display: inline-block;
   padding: 1px 5px;
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: "Cascadia Mono", "DejaVu Sans Mono", Consolas, monospace;
   font-size: 11px;
   color: var(--fg-muted);
   background: var(--bg-elevated);
@@ -740,7 +741,8 @@ kbd {
 
 /* 代码 */
 .preview code {
-  font-family: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  font-family: "Cascadia Mono", "JetBrains Mono", "DejaVu Sans Mono", Consolas,
+    monospace;
   font-size: 0.88em;
   padding: 0.18em 0.4em;
   background: var(--bg-code);
@@ -888,7 +890,7 @@ kbd {
 
 .outline-lv {
   flex: none;
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: "Cascadia Mono", "DejaVu Sans Mono", Consolas, monospace;
   font-size: 9.5px;
   color: var(--fg-faint);
   padding-top: 1px;

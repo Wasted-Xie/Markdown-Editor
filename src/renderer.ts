@@ -317,7 +317,8 @@ async function loadMermaid(
       // mermaid 的主题名没有 "light"，浅色对应 "default"
       theme: theme === "dark" ? "dark" : "default",
       fontFamily:
-        '"Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif',
+        '"Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", ' +
+        '"Source Han Sans SC", "WenQuanYi Micro Hei", system-ui, sans-serif',
       flowchart: { useMaxWidth: true, htmlLabels: true },
       sequence: { useMaxWidth: true },
       gantt: { useMaxWidth: true },
