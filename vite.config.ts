@@ -16,8 +16,15 @@ export default defineConfig({
     host: host || false,
     hmr: host ? { protocol: "ws", host, port: 1421 } : undefined,
     watch: {
-      // Rust 侧改动由 cargo 自己监听，Vite 不必扫描
-      ignored: ["**/src-tauri/**"],
+      // 这些目录不参与前端构建，但会被监听器扫到。
+      // Windows 上文件替换存在瞬时锁，扫到会抛 EBUSY 让 dev server 直接退出。
+      ignored: [
+        "**/src-tauri/**",
+        "**/.git/**",
+        "**/.temp/**",
+        "**/.backup/**",
+        "**/node_modules/**",
+      ],
     },
   },
 

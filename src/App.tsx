@@ -13,6 +13,11 @@ import {
   type DiagramTheme,
 } from "./renderer";
 import {
+  dataUrlToBase64,
+  exportElementAsImage,
+  renderExportRoot,
+} from "./exportImage";
+import {
   askConfirm,
   baseName,
   clipboardHasFiles,
@@ -35,6 +40,7 @@ import {
   readFile,
   renameEntry,
   safeFileName,
+  saveBinary,
   setWorkspaceRoot,
   writeFile,
 } from "./fs";
@@ -689,6 +695,54 @@ export default function App() {
     window.setTimeout(() => window.print(), 120);
   }, [content]);
 
+  /** 导出长图：整篇渲染成一张 PNG，超长时自动分片再拼接 */
+  const handleExportImage = useCallback(async () => {
+    if (!content) {
+      setStatus({ kind: "warn", text: "当前没有内容可导出" });
+      return;
+    }
+
+    const title = currentPath ? fileStem(currentPath) : "document";
+    setBusy(true);
+    setStatus({ kind: "info", text: "正在渲染图片…" });
+
+    // 离屏容器必须在任何 await 之前挂上，之后无论成功失败都要移除
+    let root: HTMLElement | null = null;
+    try {
+      root = await renderExportRoot(content);
+
+      const result = await exportElementAsImage(root, {
+        onProgress: (_ratio, message) => {
+          setStatus({ kind: "info", text: message });
+        },
+      });
+
+      const saved = await saveBinary(
+        dataUrlToBase64(result.dataUrl),
+        `${safeFileName(title)}.png`,
+        "PNG 图片",
+        ["png"],
+      );
+
+      if (!saved) {
+        setStatus({ kind: "info", text: "已取消导出" });
+        return;
+      }
+
+      const size = `${result.width}×${result.height}`;
+      const sliceNote = result.sliced ? `（分 ${result.sliceCount} 片拼接）` : "";
+      setStatus({
+        kind: "ok",
+        text: `已导出图片 ${size}${sliceNote} → ${saved}`,
+      });
+    } catch (err) {
+      setStatus({ kind: "error", text: describeError(err) });
+    } finally {
+      root?.remove();
+      setBusy(false);
+    }
+  }, [content, currentPath]);
+
   // -------------------------------------------------------------------------
   // 窗口关闭：Tauri 在用户点关闭时广播 tauri://close-requested，
   // 这里拦下并由 confirmSaveIfDirty 决定是否保存，最后才真正销毁窗口
@@ -957,6 +1011,13 @@ export default function App() {
         return;
       }
 
+      // Ctrl+Shift+I 导出图片（Ctrl+I 在编辑器里是斜体，故加 Shift）
+      if (key === "i" && event.shiftKey) {
+        event.preventDefault();
+        void handleExportImage();
+        return;
+      }
+
       // Ctrl+\ 显示 / 收起文件面板（CodeMirror 未占用该组合）
       if (key === "\\") {
         event.preventDefault();
@@ -987,6 +1048,7 @@ export default function App() {
     return () => window.removeEventListener("keydown", handler);
   }, [
     handleExportHtml,
+    handleExportImage,
     handleExportPdf,
     createFileIn,
     handleOpenFile,
@@ -1084,6 +1146,15 @@ export default function App() {
             title="Ctrl+Shift+E"
           >
             导出 HTML
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => void handleExportImage()}
+            disabled={!content || busy}
+            title="Ctrl+Shift+I"
+          >
+            导出图片
           </button>
           <button
             type="button"

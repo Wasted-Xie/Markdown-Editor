@@ -26,6 +26,7 @@
     "@vscode/markdown-it-katex": "^1.1.2",
     "dompurify": "^3.4.15",
     "highlight.js": "^11.12.0",
+    "html-to-image": "^1.11.13",
     "katex": "^0.16.22",
     "markdown-it": "^15.0.2",
     "markdown-it-task-lists": "^2.1.1",

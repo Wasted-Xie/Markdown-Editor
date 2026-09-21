@@ -124,6 +124,25 @@ export function exportHtml(
   return invoke<string | null>("export_html", { html, defaultName });
 }
 
+/**
+ * 弹出「另存为」对话框并写出二进制（Base64 传入），取消时返回 null。
+ *
+ * 走 Base64 而不是字节数组：图片动辄数 MB，数组形式经 IPC 会膨胀很多倍。
+ */
+export function saveBinary(
+  base64Data: string,
+  defaultName: string,
+  filterName: string,
+  extensions: string[],
+): Promise<string | null> {
+  return invoke<string | null>("save_binary", {
+    base64Data,
+    defaultName,
+    filterName,
+    extensions,
+  });
+}
+
 /** 在系统文件管理器中定位文件 */
 export function openInExplorer(path: string): Promise<void> {
   return invoke<void>("open_in_explorer", { path });

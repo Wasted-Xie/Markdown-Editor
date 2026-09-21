@@ -33,6 +33,7 @@ pub fn run() {
             commands::path_exists,
             commands::path_info,
             commands::export_html,
+            commands::save_binary,
             commands::open_in_explorer,
             commands::create_entry,
             commands::rename_entry,

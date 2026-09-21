@@ -222,6 +222,105 @@ pub async fn export_html(
     Ok(Some(target.to_string_lossy().replace('\\', "/")))
 }
 
+/// 弹出保存对话框，把二进制数据（Base64 传入）写入用户选择的位置。
+///
+/// 用于导出图片：前端把 canvas 编成 data URL，这里解码后落盘，
+/// 避免把大体积二进制经 IPC 以数组形式传输。
+#[tauri::command]
+pub async fn save_binary(
+    app: tauri::AppHandle,
+    base64_data: String,
+    default_name: String,
+    filter_name: String,
+    extensions: Vec<String>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let file_name = if default_name.trim().is_empty() {
+        "export.bin".to_string()
+    } else {
+        default_name
+    };
+
+    let exts: Vec<&str> = extensions.iter().map(|s| s.as_str()).collect();
+    let filter_label = if filter_name.trim().is_empty() {
+        "文件".to_string()
+    } else {
+        filter_name
+    };
+
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("导出")
+        .set_file_name(&file_name)
+        .add_filter(&filter_label, &exts)
+        .blocking_save_file();
+
+    let Some(target) = picked else {
+        return Ok(None);
+    };
+
+    let target = target
+        .into_path()
+        .map_err(|e| format!("无法解析保存路径：{e}"))?;
+
+    let bytes = decode_base64(&base64_data)?;
+    std::fs::write(&target, &bytes).map_err(|e| format!("写入失败：{e}"))?;
+
+    Ok(Some(normalize(&target)))
+}
+
+/// 标准 Base64 解码（容忍换行与 data URL 前缀）。
+fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    // 允许直接传 data URL
+    let raw = match input.find("base64,") {
+        Some(idx) => &input[idx + "base64,".len()..],
+        None => input,
+    };
+
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let cleaned: Vec<u8> = raw
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+
+    let mut out = Vec::with_capacity(cleaned.len() / 4 * 3);
+
+    for chunk in cleaned.chunks(4) {
+        if chunk.len() == 1 {
+            return Err("Base64 数据不完整".to_string());
+        }
+
+        let mut acc: u32 = 0;
+        for (i, byte) in chunk.iter().enumerate() {
+            // 兼容 URL-safe 变体
+            let normalized = match byte {
+                b'-' => b'+',
+                b'_' => b'/',
+                other => *other,
+            };
+            let idx = TABLE
+                .iter()
+                .position(|c| *c == normalized)
+                .ok_or_else(|| format!("非法 Base64 字符：{}", *byte as char))?;
+            acc |= (idx as u32) << (18 - 6 * i);
+        }
+
+        out.push((acc >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((acc >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(acc as u8);
+        }
+    }
+
+    Ok(out)
+}
+
 /// 关闭主窗口。
 ///
 /// 用于「关闭前询问是否保存」流程：前端在 `onCloseRequested` 里
