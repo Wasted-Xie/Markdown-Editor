@@ -538,7 +538,18 @@ foreach ($line in $text.Split([char]10)) {{
 $data = New-Object System.Windows.Forms.DataObject
 $data.SetFileDropList($files)
 {extra}
-[System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+# 剪贴板是全局共享资源，其它进程（剪贴板管理器、Office、浏览器等）
+# 短暂占用时 SetDataObject 会抛 CLIPBRD_E_CANT_OPEN。官方建议重试。
+$ok = $false
+for ($i = 0; $i -lt 10 -and -not $ok; $i++) {{
+  try {{
+    [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+    $ok = $true
+  }} catch {{
+    Start-Sleep -Milliseconds 120
+  }}
+}}
+if (-not $ok) {{ throw '剪贴板被其它程序占用，请稍后重试' }}
 "#,
             payload = encode_utf16_base64(&paths.join("\n"))
         );
@@ -571,7 +582,17 @@ pub fn clipboard_has_files() -> bool {
     {
         let script = r#"$ErrorActionPreference='SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
-if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) { [Console]::Out.Write('yes') } else { [Console]::Out.Write('no') }
+# 剪贴板被其它进程占用时读取会抛异常，重试若干次
+$answer = 'no'
+for ($i = 0; $i -lt 8; $i++) {
+  try {
+    if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) { $answer = 'yes' }
+    break
+  } catch {
+    Start-Sleep -Milliseconds 100
+  }
+}
+[Console]::Out.Write($answer)
 "#;
 
         run_powershell(script)
@@ -748,8 +769,17 @@ fn read_clipboard_files() -> Result<Vec<String>, String> {
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $utf8
 Add-Type -AssemblyName System.Windows.Forms
-if (-not [System.Windows.Forms.Clipboard]::ContainsFileDropList()) { exit 0 }
-$files = [System.Windows.Forms.Clipboard]::GetFileDropList()
+# 读取同样会被其它进程的剪贴板占用打断，需要重试
+$files = $null
+for ($i = 0; $i -lt 10 -and $null -eq $files; $i++) {
+  try {
+    if (-not [System.Windows.Forms.Clipboard]::ContainsFileDropList()) { exit 0 }
+    $files = [System.Windows.Forms.Clipboard]::GetFileDropList()
+  } catch {
+    Start-Sleep -Milliseconds 120
+  }
+}
+if ($null -eq $files) { exit 0 }
 $lines = @()
 foreach ($f in $files) { $lines += $f }
 [Console]::Out.Write([string]::Join([char]10, $lines))
