@@ -186,9 +186,15 @@ export function clipboardHasFiles(): Promise<boolean> {
   return invoke<boolean>("clipboard_has_files");
 }
 
-/** 粘贴到目标目录，返回新建的路径列表 */
-export function pasteEntries(destDir: string, cut: boolean): Promise<string[]> {
-  return invoke<string[]>("paste_entries", { destDir, cut });
+/**
+ * 粘贴到目标目录，返回新建的路径列表。
+ *
+ * 不传「是否剪切」：意图由后端从剪贴板自身读取（DropEffect / gnome-copied-files），
+ * 因为剪贴板随时可能被资源管理器等外部程序改写，
+ * 前端记忆的状态会过期，导致「复制」被当成「剪切」而移走原文件。
+ */
+export function pasteEntries(destDir: string): Promise<string[]> {
+  return invoke<string[]>("paste_entries", { destDir });
 }
 
 // ---------------------------------------------------------------------------

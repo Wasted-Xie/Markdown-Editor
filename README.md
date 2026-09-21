@@ -170,6 +170,35 @@ Shell 菜单 —— 跨平台一致、可控性高。剪贴板通过 PowerShell 
 `System.Windows.Forms.Clipboard` 实现真正的 `CF_HDROP` 文件列表，
 并设置 `Preferred DropEffect` 以区分复制与剪切，因此与资源管理器双向互通。
 
+> **「复制还是剪切」只由剪贴板决定，前端不记忆这个状态。**
+> 剪贴板是全局共享的，用户随时可能在资源管理器里重新复制一批文件；
+> 前端若用 ref 记住「上次点的是剪切」，那个状态在剪贴板被外部改写后就是错的，
+> 表现为「明明点了复制，粘贴却把原文件移走了」。
+> 因此 `paste_entries` 不接受 `cut` 参数，而是从剪贴板读 `Preferred DropEffect`
+> （Linux 读 `x-special/gnome-copied-files`），
+> 判定收敛在 `effect_is_cut` 一处：**只有「含 MOVE 且不含 COPY」才算剪切**，
+> 其余一律按复制处理 —— 复制最多多留一份文件，误判成剪切却会真的删掉用户的文件。
+> 读取时一次拿到「意图 + 路径」，避免两次读取之间被外部改写。
+
+> **写 `Preferred DropEffect` 只能用 `MemoryStream`，绝不能用 `[byte[]]`。**
+> 这是「复制变剪切」最隐蔽的一层，两个坑叠在一起：
+>
+> 1. `DataObject.SetData(string, byte[])` 不会存成 4 字节 DWORD，
+>    而是用 `BinaryFormatter` 把字节数组包成 NRBF blob
+>    （实测 `GlobalSize=48`，开头是 `96-A7-9E-FD-13-3B-70-43` 这种类型头）。
+> 2. 资源管理器按**裸 DWORD** 解释这段内存，取前 4 字节 `0xFD9EA796`：
+>    bit0(COPY)=0、bit1(MOVE)=1 —— 恰好满足「含 MOVE 且不含 COPY」，
+>    于是「复制」被当成「剪切」，粘贴到别处会把原文件移走。
+>
+> 之所以极难发现：**只用 .NET 的 `GetData` 读回是测不出来的** ——
+> 它能正确反序列化自己写的 blob，读写自洽、看起来完全正常，
+> 只有跨进程（资源管理器）才暴露。因此回归测试
+> `clipboard_dropeffect_is_raw_dword` 绕过 .NET，
+> 用 Win32 `GetClipboardData` + `GlobalLock` 直接断言 HGLOBAL 是 4 字节。
+>
+> 对称地，读取端也要认 `MemoryStream`：裸 DWORD 经 .NET 读回就是
+> `MemoryStream`，而资源管理器写的正是这种形式。
+
 > PowerShell 调用有三个坑，都在 `commands.rs` 里绕过了：
 > 1. 脚本用 `-EncodedCommand`（UTF-16LE 的 Base64）传入，不能用 `-Command`
 >    —— 后者在解析参数时会吃掉双引号，`` -split "`n" `` 会变成语法错误。

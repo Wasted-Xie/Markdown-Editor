@@ -140,8 +140,6 @@ export default function App() {
   const [menu, setMenu] = useState<ContextTarget | null>(null);
   /** 剪贴板里是否有文件，决定「粘贴」是否可用 */
   const [clipboardReady, setClipboardReady] = useState(false);
-  /** 上次复制是否为剪切，粘贴时据此决定是否移动原文件 */
-  const clipboardCutRef = useRef(false);
 
   // ---- refs ----
   const editorHandle = useRef<EditorHandle | null>(null);
@@ -470,12 +468,18 @@ export default function App() {
     [],
   );
 
-  /** 粘贴剪贴板里的文件到目标目录 */
+  /**
+   * 粘贴剪贴板里的文件到目标目录。
+   *
+   * 不传「是否剪切」：剪贴板随时可能被资源管理器等外部程序改写，
+   * 由前端记忆这个状态会导致「点了复制却把原文件移走」。
+   * 意图由后端从剪贴板自身读取。
+   */
   const handlePaste = useCallback(
     async (destDir: string) => {
       setBusy(true);
       try {
-        const created = await pasteEntries(destDir, clipboardCutRef.current);
+        const created = await pasteEntries(destDir);
         refreshTree();
         setStatus({ kind: "ok", text: `已粘贴 ${created.length} 项` });
       } catch (err) {
@@ -578,7 +582,6 @@ export default function App() {
         return;
       }
       if (action === "cut" && target) {
-        clipboardCutRef.current = true;
         void handleClipboard([target.path], true);
         return;
       }

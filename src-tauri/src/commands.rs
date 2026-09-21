@@ -517,12 +517,8 @@ pub fn clipboard_set_files(
 
     #[cfg(target_os = "windows")]
     {
-        // 用 $b64 变量承载，避免 PowerShell 把 $data.SetData 之类误当插值
-        let extra = if cut {
-            r#"$data.SetData('Preferred DropEffect', [byte[]](2,0,0,0))"#
-        } else {
-            r#"$data.SetData('Preferred DropEffect', [byte[]](5,0,0,0))"#
-        };
+        // DROPEFFECT_COPY = 1，DROPEFFECT_MOVE = 2（oleidl.h）
+        let effect = if cut { 2 } else { 1 };
 
         let script = format!(
             r#"$ErrorActionPreference='Stop'
@@ -537,7 +533,21 @@ foreach ($line in $text.Split([char]10)) {{
 }}
 $data = New-Object System.Windows.Forms.DataObject
 $data.SetFileDropList($files)
-{extra}
+
+# CFSTR_PREFERREDDROPEFFECT 必须是一个裸 DWORD（HGLOBAL，4 字节）。
+# 这里只能用 MemoryStream，绝对不能用 [byte[]]：
+# DataObject.SetData(string, byte[]) 会把字节数组当成「可序列化对象」，
+# 用 BinaryFormatter 打包成 NRBF blob（实测 GlobalSize=48，
+# 开头是 96-A7-9E-FD-13-3B-70-43 这种类型头），而不是 4 字节 DWORD。
+# 后果：本应用自己用 .NET 读回能正确反序列化（所以自测看起来是好的），
+# 但资源管理器按裸 DWORD 解释，读到的前 4 字节是类型头，
+# 恰好 bit1(MOVE)=1 且 bit0(COPY)=0 —— 于是「复制」被当成「剪切」，
+# 粘贴到别处会把原文件移走。
+$ms = New-Object System.IO.MemoryStream
+$ms.Write([byte[]]({effect},0,0,0), 0, 4)
+$ms.Position = 0
+$data.SetData('Preferred DropEffect', $ms)
+
 # 剪贴板是全局共享资源，其它进程（剪贴板管理器、Office、浏览器等）
 # 短暂占用时 SetDataObject 会抛 CLIPBRD_E_CANT_OPEN。官方建议重试。
 $ok = $false
@@ -551,7 +561,8 @@ for ($i = 0; $i -lt 10 -and -not $ok; $i++) {{
 }}
 if (-not $ok) {{ throw '剪贴板被其它程序占用，请稍后重试' }}
 "#,
-            payload = encode_utf16_base64(&paths.join("\n"))
+            payload = encode_utf16_base64(&paths.join("\n")),
+            effect = effect
         );
 
         run_powershell(&script)?;
@@ -612,15 +623,20 @@ for ($i = 0; $i -lt 8; $i++) {
 }
 
 /// 粘贴：把剪贴板里的文件复制 / 移动到目标目录，返回新建的路径列表。
+///
+/// 「复制还是剪切」完全由剪贴板自身携带的意图决定（见 [`read_clipboard_files`]），
+/// 不接受调用方传参 —— 剪贴板可能已被外部程序改写，
+/// 由前端记忆这个状态会导致「点了复制却移走原文件」。
 #[tauri::command]
 pub fn paste_entries(
     dest_dir: String,
-    cut: bool,
     state: State<'_, WorkspaceState>,
 ) -> Result<Vec<String>, String> {
     ensure_inside_root(&dest_dir, &state)?;
 
-    let sources = read_clipboard_files()?;
+    let clipboard = read_clipboard_files()?;
+    let sources = clipboard.paths;
+    let cut = clipboard.cut;
     if sources.is_empty() {
         return Err("剪贴板里没有文件".to_string());
     }
@@ -640,15 +656,9 @@ pub fn paste_entries(
             continue;
         }
 
-        let Some(file_name) = src_path.file_name() else {
+        let Some(target) = plan_paste_target(&src_path, &dest, cut) else {
             continue;
         };
-        let target = unique_path(&dest.join(file_name));
-
-        // 粘到自己所在的目录时，unique_path 会给出「xxx (1)」这样的副本名
-        if cut && target == src_path {
-            continue;
-        }
 
         if cut {
             move_entry(&src_path, &target)?;
@@ -666,6 +676,22 @@ pub fn paste_entries(
     }
 
     Ok(created)
+}
+
+/// 算出某个源文件粘贴到 `dest` 时的目标路径；返回 `None` 表示无需操作。
+///
+/// 拆成纯函数是为了让「剪切到自身所在目录」这条边界能被测试覆盖 ——
+/// 它必须在 [`unique_path`] **之前**判断：否则会先算出「xxx (1)」这种副本名，
+/// 把一个原地剪切变成凭空多出一份副本。
+fn plan_paste_target(src: &Path, dest: &Path, cut: bool) -> Option<PathBuf> {
+    let file_name = src.file_name()?;
+
+    // 剪切到自身所在目录：原文件已经在目标位置，什么都不用做
+    if cut && src.parent() == Some(dest) {
+        return None;
+    }
+
+    Some(unique_path(&dest.join(file_name)))
 }
 
 // ---------------------------------------------------------------------------
@@ -758,58 +784,144 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 剪贴板中的文件列表，以及它携带的操作意图。
+///
+/// 关键点：**「是复制还是剪切」必须从剪贴板里读，不能由前端自己记**。
+/// 剪贴板是全局共享的，用户随时可能在资源管理器里重新复制一批文件；
+/// 前端若用 ref 记住「上次点的是剪切」，那个状态在剪贴板被外部改写后就是错的，
+/// 表现为「明明点了复制，粘贴却把原文件移走了」。
+struct ClipboardFiles {
+    paths: Vec<String>,
+    /// true 表示这次粘贴应当移动源文件（剪切），false 表示复制
+    cut: bool,
+}
+
+/// 判定剪贴板里的操作意图是否为「剪切」。
+///
+/// 依据 CFSTR_PREFERREDDROPEFFECT（Windows）或 x-special/gnome-copied-files
+/// 首行（Linux），两者都由文件管理器与其它应用共同遵守。
+///
+/// 只认「明确是 MOVE 且不含 COPY」这一种情况，其余一律按复制处理：
+/// 复制最多是多留一份文件，误判成剪切却会真的删掉用户的文件。
+fn effect_is_cut(effect: u32) -> bool {
+    const DROPEFFECT_COPY: u32 = 1;
+    const DROPEFFECT_MOVE: u32 = 2;
+
+    effect & DROPEFFECT_MOVE != 0 && effect & DROPEFFECT_COPY == 0
+}
+
 /// 读取剪贴板中的文件列表。
 ///
 /// 必须显式把 stdout 设成 UTF-8：PowerShell 默认按系统 ANSI 代码页（简中为
 /// GBK/936）输出，非 ASCII 路径回传后会被按 UTF-8 解码成乱码，
 /// 表现为「剪贴板里的文件都找不到」，粘贴直接失败。
+///
+/// 输出格式统一为「首行 DropEffect 数值，其余每行一个路径」，
+/// 这样只读一次剪贴板就能同时拿到内容与意图，不会在两次读取之间被外部改写；
+/// 且「什么算剪切」的判定只存在于 [`effect_is_cut`] 一处，不会两平台漂移。
 #[cfg(target_os = "windows")]
-fn read_clipboard_files() -> Result<Vec<String>, String> {
+fn read_clipboard_files() -> Result<ClipboardFiles, String> {
     let script = r#"$ErrorActionPreference='SilentlyContinue'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $utf8
 Add-Type -AssemblyName System.Windows.Forms
 # 读取同样会被其它进程的剪贴板占用打断，需要重试
-$files = $null
-for ($i = 0; $i -lt 10 -and $null -eq $files; $i++) {
-  try {
-    if (-not [System.Windows.Forms.Clipboard]::ContainsFileDropList()) { exit 0 }
-    $files = [System.Windows.Forms.Clipboard]::GetFileDropList()
-  } catch {
-    Start-Sleep -Milliseconds 120
-  }
+$obj = $null
+for ($i = 0; $i -lt 10 -and $null -eq $obj; $i++) {
+  try { $obj = [System.Windows.Forms.Clipboard]::GetDataObject() } catch { Start-Sleep -Milliseconds 120 }
 }
+if ($null -eq $obj) { exit 0 }
+$files = $null
+try {
+  if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
+    $files = [System.Windows.Forms.Clipboard]::GetFileDropList()
+  }
+} catch { }
 if ($null -eq $files) { exit 0 }
-$lines = @()
+$effect = 0
+try {
+  if ($obj.GetDataPresent('Preferred DropEffect')) {
+    $raw = $obj.GetData('Preferred DropEffect')
+    # 裸 DWORD 经 .NET 读回是 MemoryStream（资源管理器与标准写入方都是这种）；
+    # 另有写入方用 SetData(..., int) 时读回 Int32，也要认。
+    # byte[] 分支必须限定「恰好 4 字节」：旧版本本应用用 [byte[]] 写入过，
+    # 那实际是 48 字节的 NRBF blob，若按前 4 字节解释会读到类型头
+    # （0xFD9EA796，bit1=1 且 bit0=0）而误判成剪切。
+    # 长度不是 4 就说明它不是裸 DWORD，此时保持 effect=0（按复制处理）最安全。
+    if ($raw -is [System.IO.MemoryStream]) {
+      $b = $raw.ToArray()
+      if ($b.Length -eq 4) {
+        $effect = [int]$b[0] -bor ([int]$b[1] -shl 8) -bor ([int]$b[2] -shl 16) -bor ([int]$b[3] -shl 24)
+      }
+    } elseif ($raw -is [byte[]] -and $raw.Length -eq 4) {
+      $effect = [int]$raw[0] -bor ([int]$raw[1] -shl 8) -bor ([int]$raw[2] -shl 16) -bor ([int]$raw[3] -shl 24)
+    } elseif ($raw -is [int] -or $raw -is [long]) {
+      $effect = [int]$raw
+    }
+  }
+} catch { }
+$lines = @([string]$effect)
 foreach ($f in $files) { $lines += $f }
 [Console]::Out.Write([string]::Join([char]10, $lines))
 "#;
 
     let out = run_powershell(script)?;
-
-    Ok(out
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect())
+    Ok(parse_clipboard_payload(&out))
 }
 
 #[cfg(target_os = "linux")]
-fn read_clipboard_files() -> Result<Vec<String>, String> {
+fn read_clipboard_files() -> Result<ClipboardFiles, String> {
+    // gnome-copied-files 的首行是 cut/copy，映射成与 Windows 相同的
+    // DropEffect 数值后交给统一判定；该类型读不到时保持 0（按复制处理）。
     let out = run_shell(
-        r#"if command -v wl-paste >/dev/null 2>&1; then
+        r#"effect=0
+if command -v wl-paste >/dev/null 2>&1; then
+  g=$(wl-paste --no-newline --type x-special/gnome-copied-files 2>/dev/null | head -n 1)
+  [ "$g" = "cut" ] && effect=2
+  [ "$g" = "copy" ] && effect=1
+  echo "$effect"
   wl-paste --no-newline --type text/uri-list 2>/dev/null
 elif command -v xclip >/dev/null 2>&1; then
+  g=$(xclip -selection clipboard -t x-special/gnome-copied-files -o 2>/dev/null | head -n 1)
+  [ "$g" = "cut" ] && effect=2
+  [ "$g" = "copy" ] && effect=1
+  echo "$effect"
   xclip -selection clipboard -t text/uri-list -o 2>/dev/null
 fi"#,
     )?;
 
-    Ok(out.lines().filter_map(parse_file_uri).collect())
+    let mut parsed = parse_clipboard_payload(&out);
+    // Windows 侧由脚本产出路径，Linux 侧拿到的是 URI，需要在这里还原
+    parsed.paths = parsed.paths.iter().filter_map(|l| parse_file_uri(l)).collect();
+    Ok(parsed)
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
-fn read_clipboard_files() -> Result<Vec<String>, String> {
+fn read_clipboard_files() -> Result<ClipboardFiles, String> {
     Err("当前平台暂不支持读取系统剪贴板".to_string())
+}
+
+/// 解析「首行 DropEffect 数值，其余每行一个路径」的剪贴板输出。
+///
+/// 首行缺失或不是数字时按复制处理（绝不误判成剪切），
+/// 并把首行当作路径，兼容不带意图标记的旧格式。
+fn parse_clipboard_payload(raw: &str) -> ClipboardFiles {
+    let mut lines = raw.lines().map(|l| l.trim_end().to_string());
+    let first = lines.next().unwrap_or_default();
+
+    let Ok(effect) = first.trim().parse::<u32>() else {
+        let mut paths = Vec::new();
+        if !first.trim().is_empty() {
+            paths.push(first);
+        }
+        paths.extend(lines.filter(|l| !l.trim().is_empty()));
+        return ClipboardFiles { paths, cut: false };
+    };
+
+    ClipboardFiles {
+        paths: lines.filter(|l| !l.trim().is_empty()).collect(),
+        cut: effect_is_cut(effect),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,12 +1437,23 @@ mod tests {
         assert_eq!(out.trim(), "ok");
     }
 
+    /// 剪贴板是全局单例，多个测试并行读写会互相踩踏
+    /// （表现为写入抛 CLIPBRD_E_CANT_OPEN，或读到别的测试刚写进去的内容）。
+    /// 所有会碰真实剪贴板的测试都必须先拿这把锁。
+    static CLIPBOARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 把给定路径写入系统剪贴板（测试用，走与命令相同的实现路径）
-    fn put_files_on_clipboard(paths: &[String]) {
+    ///
+    /// `cut` 决定写入的 DropEffect，用来验证「粘贴时从剪贴板读取意图」是否正确。
+    fn put_files_on_clipboard_with(paths: &[String], cut: bool) {
+        // DROPEFFECT_COPY = 1，DROPEFFECT_MOVE = 2
+        let effect = if cut { 2 } else { 1 };
+        // 必须与生产代码一致：DropEffect 用 MemoryStream 写成裸 DWORD，
+        // 不能用 [byte[]]（会被 BinaryFormatter 包成 NRBF blob）。
+        // 重试逻辑同样与生产代码保持一致。
         let script = format!(
             r#"$ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
 $b64 = '{payload}'
 $text = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($b64))
 $files = New-Object System.Collections.Specialized.StringCollection
@@ -1340,18 +1463,141 @@ foreach ($line in $text.Split([char]10)) {{
 }}
 $data = New-Object System.Windows.Forms.DataObject
 $data.SetFileDropList($files)
-$data.SetData('Preferred DropEffect', [byte[]](5,0,0,0))
-[System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+$ms = New-Object System.IO.MemoryStream
+$ms.Write([byte[]]({effect},0,0,0), 0, 4)
+$ms.Position = 0
+$data.SetData('Preferred DropEffect', $ms)
+$ok = $false
+for ($i = 0; $i -lt 10 -and -not $ok; $i++) {{
+  try {{
+    [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+    $ok = $true
+  }} catch {{
+    Start-Sleep -Milliseconds 120
+  }}
+}}
+if (-not $ok) {{ throw '剪贴板被其它程序占用，请稍后重试' }}
 "#,
-            payload = encode_utf16_base64(&paths.join("\n"))
+            payload = encode_utf16_base64(&paths.join("\n")),
+            effect = effect
         );
 
         run_powershell(&script).expect("写入剪贴板失败");
     }
 
+    /// 兼容旧调用：默认按复制写入
+    fn put_files_on_clipboard(paths: &[String]) {
+        put_files_on_clipboard_with(paths, false);
+    }
+
+    // ---- 纯逻辑测试：不碰真实剪贴板，可在任何环境跑 ----
+
+    #[test]
+    fn effect_is_cut_only_for_pure_move() {
+        assert!(!effect_is_cut(0), "无 DropEffect 应按复制处理");
+        assert!(!effect_is_cut(1), "DROPEFFECT_COPY 不是剪切");
+        assert!(effect_is_cut(2), "DROPEFFECT_MOVE 是剪切");
+        assert!(!effect_is_cut(3), "COPY|MOVE 同时存在时按复制处理");
+        assert!(!effect_is_cut(4), "DROPEFFECT_LINK 不是剪切");
+        assert!(!effect_is_cut(5), "COPY|LINK 不是剪切");
+    }
+
+    #[test]
+    fn parse_payload_reads_op_and_paths() {
+        let copy = parse_clipboard_payload("1\nC:/a.md\nC:/b.md\n");
+        assert!(!copy.cut);
+        assert_eq!(copy.paths, vec!["C:/a.md", "C:/b.md"]);
+
+        let cut = parse_clipboard_payload("2\nC:/a.md\n");
+        assert!(cut.cut);
+        assert_eq!(cut.paths, vec!["C:/a.md"]);
+    }
+
+    #[test]
+    fn parse_payload_defaults_to_copy_when_op_missing() {
+        // 首行不是数值（旧格式/异常输出）时按复制，绝不误判成剪切
+        let parsed = parse_clipboard_payload("C:/a.md\nC:/b.md\n");
+        assert!(!parsed.cut, "缺少标记时必须按复制处理");
+        assert_eq!(parsed.paths, vec!["C:/a.md", "C:/b.md"]);
+
+        let empty = parse_clipboard_payload("");
+        assert!(!empty.cut);
+        assert!(empty.paths.is_empty());
+    }
+
+    #[test]
+    fn parse_payload_ignores_blank_lines() {
+        let parsed = parse_clipboard_payload("1\n\nC:/a.md\n\n");
+        assert_eq!(parsed.paths, vec!["C:/a.md"]);
+    }
+
+    #[test]
+    fn parse_payload_effect_zero_is_copy() {
+        // DropEffect 缺失时脚本会输出 0，必须按复制处理
+        let parsed = parse_clipboard_payload("0\nC:/a.md\n");
+        assert!(!parsed.cut, "effect=0 应按复制处理");
+        assert_eq!(parsed.paths, vec!["C:/a.md"]);
+    }
+
+    /// 剪切到自身所在目录必须是「无操作」，
+    /// 不能因为 unique_path 先算出副本名而凭空多出一份。
+    #[test]
+    fn plan_paste_cut_into_same_dir_is_noop() {
+        let base = std::env::temp_dir().join("mde_plan_cut_self");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("a.md");
+        std::fs::write(&file, "x").unwrap();
+
+        assert!(
+            plan_paste_target(&file, &base, true).is_none(),
+            "剪切到自身目录应无操作"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 复制到自身所在目录则应产生副本（这是资源管理器的行为）。
+    #[test]
+    fn plan_paste_copy_into_same_dir_creates_copy() {
+        let base = std::env::temp_dir().join("mde_plan_copy_self");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("a.md");
+        std::fs::write(&file, "x").unwrap();
+
+        let target = plan_paste_target(&file, &base, false).expect("复制应有目标");
+        assert_eq!(
+            target.file_name().unwrap().to_string_lossy(),
+            "a-1.md",
+            "同目录复制应生成副本名"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 剪切到其它目录应给出目标路径。
+    #[test]
+    fn plan_paste_cut_into_other_dir_moves() {
+        let base = std::env::temp_dir().join("mde_plan_cut_other");
+        let src_dir = base.join("src");
+        let dst_dir = base.join("dst");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        let file = src_dir.join("a.md");
+        std::fs::write(&file, "x").unwrap();
+
+        let target = plan_paste_target(&file, &dst_dir, true).expect("剪切应有目标");
+        assert_eq!(target, dst_dir.join("a.md"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     #[ignore = "需要 GUI 环境，且会改动系统剪贴板"]
     fn clipboard_roundtrip_non_ascii_path() {
+        let _guard = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 目录名与文件名都带中文，贴近真实使用场景
         let base = std::env::temp_dir().join("mde_中文目录");
         let dir = base.join("子目录");
@@ -1360,24 +1606,145 @@ $data.SetData('Preferred DropEffect', [byte[]](5,0,0,0))
         std::fs::write(&file, "content").unwrap();
 
         let expected = normalize(&file);
-        put_files_on_clipboard(&[expected.clone()]);
+        put_files_on_clipboard(std::slice::from_ref(&expected));
 
         let back = read_clipboard_files().expect("读取剪贴板失败");
-        assert_eq!(back.len(), 1, "应读到 1 个路径");
+        assert_eq!(back.paths.len(), 1, "应读到 1 个路径");
         assert!(
-            std::path::Path::new(&back[0]).exists(),
+            std::path::Path::new(&back.paths[0]).exists(),
             "读回的路径不存在（编码损坏）：{:?}，期望 {:?}",
-            back[0],
+            back.paths[0],
             expected
+        );
+        assert!(!back.cut, "按复制写入的剪贴板不应被判定为剪切");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 回归：写入「复制」意图后，读取端必须报告 cut=false。
+    ///
+    /// 这正是「复制变剪切」bug 的防线 —— 只要读到的意图不对，
+    /// 粘贴就会把用户的原文件移走。
+    #[test]
+    #[ignore = "需要 GUI 环境，且会改动系统剪贴板"]
+    fn clipboard_reports_copy_intent() {
+        let _guard = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join("mde_意图测试");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("复制意图.md");
+        std::fs::write(&file, "x").unwrap();
+
+        put_files_on_clipboard_with(&[normalize(&file)], false);
+        let back = read_clipboard_files().expect("读取剪贴板失败");
+        assert!(!back.cut, "写入复制意图，读取却报告为剪切");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 回归：剪贴板里的 DropEffect 必须是**裸 DWORD**，不能是 .NET 序列化 blob。
+    ///
+    /// 这是「复制变剪切」真正的根因所在，也是之前所有测试都没覆盖到的一层：
+    /// `DataObject.SetData(string, byte[])` 会把字节数组用 BinaryFormatter 打包成
+    /// NRBF blob（实测 GlobalSize=48），资源管理器按裸 DWORD 解释时读到的前 4 字节
+    /// 恰好是 bit1=1、bit0=0，于是把「复制」当成「剪切」。
+    ///
+    /// 关键在于：只用 .NET 的 GetData 读回是**测不出**这个问题的 ——
+    /// 它能正确反序列化自己写的 blob，看起来完全正常。
+    /// 因此这里必须绕过 .NET，用 Win32 API 直接看 HGLOBAL 的原始字节。
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "需要 GUI 环境，且会改动系统剪贴板"]
+    fn clipboard_dropeffect_is_raw_dword() {
+        let _guard = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join("mde_裸DWORD测试");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("a.md");
+        std::fs::write(&file, "x").unwrap();
+
+        put_files_on_clipboard_with(&[normalize(&file)], false);
+
+        // 用 Add-Type 现场调用 user32/kernel32，读 CFSTR_PREFERREDDROPEFFECT
+        // 的 HGLOBAL 原始内容；输出 "size:byte0,byte1,byte2,byte3"
+        let script = r#"$ErrorActionPreference='Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class MdeClipProbe {
+  [DllImport("user32.dll", SetLastError=true)] public static extern uint RegisterClipboardFormat(string f);
+  [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr GetClipboardData(uint f);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool OpenClipboard(IntPtr h);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool CloseClipboard();
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr GlobalLock(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GlobalUnlock(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern UIntPtr GlobalSize(IntPtr h);
+  public static string Probe() {
+    uint fmt = RegisterClipboardFormat("Preferred DropEffect");
+    if (!OpenClipboard(IntPtr.Zero)) return "open-failed";
+    try {
+      IntPtr h = GetClipboardData(fmt);
+      if (h == IntPtr.Zero) return "no-data";
+      IntPtr p = GlobalLock(h);
+      if (p == IntPtr.Zero) return "lock-failed";
+      try {
+        ulong size = (ulong)GlobalSize(h);
+        int n = (int)Math.Min(size, (ulong)4);
+        byte[] buf = new byte[n];
+        Marshal.Copy(p, buf, 0, n);
+        string hex = "";
+        for (int i = 0; i < buf.Length; i++) { if (i > 0) hex += ","; hex += buf[i].ToString(); }
+        return size.ToString() + ":" + hex;
+      } finally { GlobalUnlock(h); }
+    } finally { CloseClipboard(); }
+  }
+}
+'@
+[Console]::Out.Write([MdeClipProbe]::Probe())
+"#;
+
+        let out = run_powershell(script).expect("探测剪贴板失败");
+        let out = out.trim();
+        let (size_str, bytes_str) = out.split_once(':').expect("探测输出格式异常");
+
+        assert_eq!(
+            size_str, "4",
+            "DropEffect 必须是 4 字节裸 DWORD，实际 GlobalSize={size_str}（{}）。\
+             若远大于 4，说明又被 BinaryFormatter 包成了 NRBF blob —— \
+             这正是资源管理器把「复制」当「剪切」的原因。原始输出：{out}",
+            if size_str == "48" { "典型 NRBF blob 大小" } else { "异常" }
+        );
+        assert_eq!(
+            bytes_str, "1,0,0,0",
+            "DROPEFFECT_COPY 应为小端 01-00-00-00，实际 {bytes_str}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// 端到端：复制 -> 粘贴到另一目录，且中文路径全程不变形
+    /// 回归：写入「剪切」意图后，读取端必须报告 cut=true。
     #[test]
     #[ignore = "需要 GUI 环境，且会改动系统剪贴板"]
-    fn paste_moves_non_ascii_file() {
+    fn clipboard_reports_cut_intent() {
+        let _guard = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join("mde_意图测试2");
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("剪切意图.md");
+        std::fs::write(&file, "x").unwrap();
+
+        put_files_on_clipboard_with(&[normalize(&file)], true);
+        let back = read_clipboard_files().expect("读取剪贴板失败");
+        assert!(back.cut, "写入剪切意图，读取却报告为复制");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 端到端：剪贴板写入「复制」意图时，粘贴必须复制且**保留源文件**。
+    ///
+    /// 这是「复制变剪切」的直接回归测试：修复前前端会把 cut 记成 true，
+    /// 粘贴后源文件消失。
+    #[test]
+    #[ignore = "需要 GUI 环境，且会改动系统剪贴板"]
+    fn paste_copies_and_keeps_source() {
+        let _guard = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join("mde_粘贴测试");
         let src_dir = base.join("源目录");
         let dst_dir = base.join("目标目录");
@@ -1387,14 +1754,18 @@ $data.SetData('Preferred DropEffect', [byte[]](5,0,0,0))
         let src = src_dir.join("文档 副本.md");
         std::fs::write(&src, "粘贴内容").unwrap();
 
-        put_files_on_clipboard(&[normalize(&src)]);
+        put_files_on_clipboard_with(&[normalize(&src)], false);
 
-        let sources = read_clipboard_files().expect("读取剪贴板失败");
-        assert_eq!(sources.len(), 1);
-        assert!(std::path::Path::new(&sources[0]).exists(), "源路径应为有效路径");
+        let clipboard = read_clipboard_files().expect("读取剪贴板失败");
+        assert!(!clipboard.cut, "复制意图被误判为剪切");
+        assert_eq!(clipboard.paths.len(), 1);
+        assert!(
+            std::path::Path::new(&clipboard.paths[0]).exists(),
+            "源路径应为有效路径"
+        );
 
         // 复用与命令相同的复制逻辑
-        let src_path = PathBuf::from(&sources[0]);
+        let src_path = PathBuf::from(&clipboard.paths[0]);
         let target = unique_path(&dst_dir.join(src_path.file_name().unwrap()));
         std::fs::copy(&src_path, &target).expect("复制失败");
 
@@ -1404,6 +1775,36 @@ $data.SetData('Preferred DropEffect', [byte[]](5,0,0,0))
             "粘贴内容",
             "内容不一致"
         );
+        assert!(src.exists(), "复制粘贴后源文件不应消失：{:?}", src);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 端到端：剪贴板写入「剪切」意图时，粘贴必须移动并删除源文件。
+    #[test]
+    #[ignore = "需要 GUI 环境，且会改动系统剪贴板"]
+    fn paste_moves_and_removes_source() {
+        let _guard = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join("mde_剪切测试");
+        let src_dir = base.join("源目录");
+        let dst_dir = base.join("目标目录");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+
+        let src = src_dir.join("待移动.md");
+        std::fs::write(&src, "移动内容").unwrap();
+
+        put_files_on_clipboard_with(&[normalize(&src)], true);
+
+        let clipboard = read_clipboard_files().expect("读取剪贴板失败");
+        assert!(clipboard.cut, "剪切意图被误判为复制");
+
+        let src_path = PathBuf::from(&clipboard.paths[0]);
+        let target = unique_path(&dst_dir.join(src_path.file_name().unwrap()));
+        move_entry(&src_path, &target).expect("移动失败");
+
+        assert!(target.exists(), "移动目标不存在：{:?}", target);
+        assert!(!src.exists(), "剪切后源文件应被移除：{:?}", src);
 
         let _ = std::fs::remove_dir_all(&base);
     }
