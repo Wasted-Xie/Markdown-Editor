@@ -50,6 +50,18 @@ const FINAL_MAX_AREA = 250_000_000;
 /** 默认渲染倍率。 */
 export const DEFAULT_SCALE = 2;
 
+/**
+ * 导出图的最大宽度（CSS px）。
+ *
+ * 宽元素（长公式、宽表格）无法折行，只能横向展开。若不设上限，
+ * 极端内容会产出几千像素宽的图。但上限也不能太小 —— 否则公式会被裁掉，
+ * 那正是导出要避免的问题。
+ *
+ * 取 6000：足以容纳常见的长公式与宽表格；超出这个宽度的内容极少见，
+ * 且此时会走 clamp 缩放路径。
+ */
+const MAX_CONTENT_WIDTH = 6000;
+
 /** 倍率下限；低于此值不如提示用户改用 HTML 导出。 */
 const MIN_SCALE = 0.5;
 
@@ -90,12 +102,16 @@ export interface ExportImageResult {
 }
 
 /**
- * 建一个固定宽度的离屏容器渲染文档，供导出成图片。
+ * 建一个离屏容器渲染文档，供导出成图片。
  *
- * 为什么不直接截预览区：
- *  - 预览区宽度随窗口变化，导出结果不可复现
- *  - 预览面板可能处于隐藏状态
- *  - 预览区底部有 45vh 留白（为滚动设计），会变成图里的大片空白
+ * 结构分两层，这是关键：
+ *
+ *   .export-wrap            外层：提供留白、决定最终画布宽度
+ *     └ .preview.export-root  正文栏：**固定 900px**，文本换行保持正常
+ *
+ * 为什么不能只有一层：若把正文栏本身撑宽，全文会重排成一行超长文本，
+ * 得到一张几千像素宽、却只有一两行字的废图。
+ * 正确做法是正文栏保持阅读宽度，宽表格/公式向右溢出，外层按溢出量加宽。
  *
  * 调用方负责在用完后 `element.remove()`。
  */
@@ -113,15 +129,16 @@ export async function renderExportRoot(
     .trim();
   const background = cssVar || (theme === "dark" ? "#0d1117" : "#ffffff");
 
-  const holder = document.createElement("div");
-  holder.style.cssText = [
+  // 外层：初始宽度只够正文栏 + 留白，稍后按溢出量加宽
+  const wrap = document.createElement("div");
+  wrap.className = "export-wrap";
+  wrap.style.cssText = [
     "position:fixed",
     "left:-100000px",
     "top:0",
-    `width:${width}px`,
+    `width:${width + EXPORT_PADDING * 2}px`,
     "max-width:none",
     "margin:0",
-    // 只留左右内边距；垂直留白在最终 canvas 上补，见文件头约束 2
     `padding:0 ${EXPORT_PADDING}px`,
     `background:${background}`,
     "contain:none",
@@ -129,9 +146,19 @@ export async function renderExportRoot(
     "pointer-events:none",
   ].join(";");
 
-  holder.className = "preview markdown-body";
+  // 正文栏：宽度固定，保证换行与阅读宽度一致
+  const holder = document.createElement("div");
+  holder.className = "preview markdown-body export-root";
+  holder.style.cssText = [
+    `width:${width}px`,
+    "max-width:none",
+    "margin:0",
+    "padding:0",
+  ].join(";");
   holder.innerHTML = html;
-  document.body.appendChild(holder);
+
+  wrap.appendChild(holder);
+  document.body.appendChild(wrap);
 
   try {
     await renderMermaidIn(holder, theme);
@@ -139,7 +166,70 @@ export async function renderExportRoot(
     // 图表渲染失败不该阻断导出，保留占位块即可
   }
 
-  return holder;
+  expandWrapToFitContent(wrap, holder, width);
+
+  return wrap;
+}
+
+/**
+ * 可能真正超出正文栏的元素白名单。
+ *
+ * 必须用白名单，不能遍历全部后代：KaTeX 的可伸缩符号（根号、积分号等）
+ * 内部用 `width="400em"` 的 SVG 再靠 CSS 裁切显示，
+ * 它的 getBoundingClientRect 会返回几千像素 —— 但那是**视觉上已被裁掉的内部结构**，
+ * 并非真实溢出。
+ *
+ * 早期版本遍历所有元素取最大右边界，于是画布被无谓撑宽
+ * （正文 900px、画布 2080px，右侧一大片空白）。
+ */
+const WIDE_SELECTORS = [
+  "table",
+  "pre",
+  ".katex-display",
+  ".mermaid-block",
+  "img",
+].join(",");
+
+/**
+ * 按正文栏内最宽元素的溢出量加宽外层容器。
+ *
+ * 正文栏宽度固定，所以这里改外层宽度**不会引起重排**，一次测量即可。
+ *
+ * 宽度会被 MAX_CONTENT_WIDTH 截住：公式、宽表格这类无法折行的元素，
+ * 超过上限时改为让它们自身缩放（由 styles.css 的 export-wrap--clamp 规则处理），
+ * 而不是把整张图撑到几千像素宽。
+ *
+ * @returns 实际采用的正文区宽度
+ */
+function expandWrapToFitContent(
+  wrap: HTMLElement,
+  holder: HTMLElement,
+  contentWidth: number,
+): number {
+  const base = holder.getBoundingClientRect();
+  let maxRight = contentWidth;
+  let minLeft = 0;
+
+  for (const el of holder.querySelectorAll<HTMLElement>(WIDE_SELECTORS)) {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    const right = r.right - base.left;
+    const left = r.left - base.left;
+    if (right > maxRight) maxRight = right;
+    if (left < minLeft) minLeft = left;
+  }
+
+  const natural = Math.ceil(maxRight - minLeft) + 2; // 吸收亚像素误差
+  const contentSpan = Math.min(natural, MAX_CONTENT_WIDTH);
+
+  wrap.style.width = `${contentSpan + EXPORT_PADDING * 2}px`;
+  // 供样式表判断是否需要让宽元素缩放
+  wrap.dataset.contentWidth = String(contentSpan);
+  if (natural > MAX_CONTENT_WIDTH) {
+    wrap.classList.add("export-wrap--clamp");
+  }
+
+  return contentSpan;
 }
 
 /** 取背景色：显式传入 > 计算样式 > 白色。 */

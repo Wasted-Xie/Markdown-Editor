@@ -1010,6 +1010,101 @@ kbd {
   color: var(--danger);
 }
 
+/* ---------- 导出长图的容器样式 ---------- */
+
+/*
+ * 预览区的滚动容器（表格 / 代码块 / 公式 / 图表）是为「交互式横向滚动」设计的：
+ * overflow:auto + max-width:100%。导出成静态图时，这些规则会变成
+ * 「把滚动条一起拍下来、内容被切掉」。
+ *
+ * 结构分两层，关键是**不要把正文栏撑宽**：
+ *   .export-wrap            外层，负责留白与最终宽度
+ *     └ .preview.export-root  正文栏，固定 900px，文本换行保持正常
+ *
+ * 宽元素（表格/公式）向右溢出，由外层按需加宽；
+ * 代码块改为折行，避免一行几百字符把图撑到几千像素宽。
+ */
+.export-root table {
+  /* 预览里为了横向滚动改成了 display:block，导出要还原成真正的表格 */
+  display: table;
+  /*
+   * width:auto 让窄表格保持内容宽度（与预览一致），
+   * max-width 把宽表格压在正文栏内、由单元格折行消化。
+   */
+  width: auto;
+  max-width: 100%;
+  overflow: visible;
+  table-layout: auto;
+}
+
+/*
+ * 只对单元格里的 code（URL、长命令）允许任意断行。
+ * 不要用 word-break:break-word 打在 td 上 —— 那会把普通词也拆开，
+ * 例如 "jsDelivr" 被断成 "jsDe / livr"。
+ */
+.export-root th code,
+.export-root td code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* 代码折行：长 URL / 长命令完整可见，且不会把图撑得极宽 */
+.export-root pre,
+.export-root pre code {
+  overflow: visible;
+  max-width: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.export-root .katex-display {
+  overflow: visible;
+  max-width: none;
+}
+
+.export-root .mermaid-block {
+  overflow: visible;
+  max-width: none;
+}
+
+/* 图表与图片不缩放，保持原始尺寸以免糊掉 */
+.export-root .mermaid-block svg,
+.export-root img {
+  max-width: none;
+}
+
+/*
+ * 内容宽到超过上限时（exportImage.ts 的 MAX_CONTENT_WIDTH），
+ * 让无法折行的宽元素缩放到可用宽度。
+ *
+ * 注意：这里**不能**用 overflow:auto —— 那等于把滚动条加回图里，
+ * 正是导出要修掉的问题。只做等比缩放。
+ */
+.export-wrap--clamp .export-root table {
+  max-width: 100% !important;
+}
+
+.export-wrap--clamp .export-root .katex-display,
+.export-wrap--clamp .export-root .katex-display > .katex {
+  max-width: 100% !important;
+}
+
+.export-wrap--clamp .export-root .katex-display .katex-html {
+  max-width: 100% !important;
+}
+
+.export-wrap--clamp .export-root .mermaid-block svg,
+.export-wrap--clamp .export-root img {
+  max-width: 100% !important;
+  height: auto;
+}
+
+/* 导出图里不应出现滚动条 */
+.export-root ::-webkit-scrollbar {
+  display: none;
+}
+
 /* ---------- 打印 / 导出 PDF ---------- */
 @media print {
   @page {

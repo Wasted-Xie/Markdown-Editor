@@ -16,14 +16,19 @@ export default defineConfig({
     host: host || false,
     hmr: host ? { protocol: "ws", host, port: 1421 } : undefined,
     watch: {
-      // 这些目录不参与前端构建，但会被监听器扫到。
-      // Windows 上文件替换存在瞬时锁，扫到会抛 EBUSY 让 dev server 直接退出。
+      // 这些路径不参与前端构建，却会被监听器扫到。
+      // Windows 上文件替换存在瞬时锁，扫到就抛 EBUSY 让 dev server 直接退出。
+      // 编辑器的原子保存会在目标文件旁生成 `.<name>.<pid>.<uuid>.tmpdir/`，
+      // 必须一并忽略，否则改一次源码就崩一次。
       ignored: [
         "**/src-tauri/**",
         "**/.git/**",
         "**/.temp/**",
         "**/.backup/**",
         "**/node_modules/**",
+        "**/*.tmpdir/**",
+        "**/.*.tmpdir/**",
+        "**/*.tmp",
       ],
     },
   },
