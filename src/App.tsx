@@ -310,7 +310,7 @@ export default function App() {
 
       try {
         fillingRef.current = true;
-        const text = await readFile(normalized);
+        const text = normalizeNewlines(await readFile(normalized));
         const info = await pathInfo(normalized);
 
         setCurrentPath(normalized);
@@ -814,7 +814,7 @@ export default function App() {
       if (!hasLocalEdits) {
         // 本地无改动，静默重新加载
         try {
-          const text = await readFile(path);
+          const text = normalizeNewlines(await readFile(path));
           if (cancelled) return;
           setContent(text);
           setSavedContent(text);
@@ -848,7 +848,7 @@ export default function App() {
 
       if (!keepLocal) {
         try {
-          const text = await readFile(path);
+          const text = normalizeNewlines(await readFile(path));
           if (!cancelled) {
             setContent(text);
             setSavedContent(text);
@@ -1424,4 +1424,18 @@ function describeError(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+/**
+ * 统一行尾为 LF，并去掉 BOM。
+ *
+ * 必须做这一步：CodeMirror 内部只认 `\n`，载入含 `\r\n` 的文本时它会
+ * 把行尾规范化并通过 `onChange` 回写。若基线 `savedContent` 仍是磁盘原文，
+ * 两者立刻不相等 → **一打开文件就显示「未保存」**（已实测复现）。
+ *
+ * 代价：保存时会把文件行尾从 CRLF 改成 LF。对 Markdown 无影响，
+ * 且与 Git 的默认行为（`core.autocrlf`）一致。
+ */
+function normalizeNewlines(text: string): string {
+  return text.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
 }
