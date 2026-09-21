@@ -146,6 +146,15 @@ export default function App() {
   const previewHandle = useRef<PreviewHandle | null>(null);
   const lastMeta = useRef<{ modifiedMs: number; size: number } | null>(null);
   const promptOpen = useRef(false);
+  /**
+   * 已经就「当前文件在磁盘上不存在」提示过的路径。
+   *
+   * 必须独立记录，不能靠把 lastMeta 置空来防重复 ——
+   * 文件不存在这个分支根本不读 lastMeta，置空后下一轮轮询会再次进入该分支，
+   * 于是每 3 秒弹一次窗（用户看到的就是「每次刷新文件夹都弹一次」）。
+   * 换成当前文件的路径后要复位，这样切到另一个同样缺失的文件时仍会提示。
+   */
+  const missingNotifiedPath = useRef<string | null>(null);
   const previewScrolling = useRef(false);
   /** 大纲跳转进行中：期间暂停滚动联动，避免两个滚动互相覆盖 */
   const jumpPauseRef = useRef(false);
@@ -784,6 +793,12 @@ export default function App() {
 
     let cancelled = false;
 
+    // 换文件时复位「已提示缺失」标记：这个 effect 依赖 currentPath，
+    // 切换文件（打开/重命名/删除/换工作区）都会重跑，
+    // 在这里复位可覆盖全部路径，不必在每个调用点各写一遍。
+    // 注意不能放进 interval 里 —— 那样每轮都会复位，等于没防重复。
+    missingNotifiedPath.current = null;
+
     const timer = window.setInterval(async () => {
       if (promptOpen.current) return;
       const path = appRefs.path;
@@ -797,7 +812,11 @@ export default function App() {
 
       // 文件被删除或重命名
       if (!info.exists) {
-        // 清空基线，避免每轮轮询都重复提示
+        // 同一个路径只提示一次：否则每轮轮询（3 秒）都会弹窗，
+        // 用户会看到「每次刷新文件夹都弹一次」
+        if (missingNotifiedPath.current === path) return;
+
+        missingNotifiedPath.current = path;
         lastMeta.current = null;
         promptOpen.current = true;
         await notify(
@@ -806,6 +825,9 @@ export default function App() {
         promptOpen.current = false;
         return;
       }
+
+      // 文件又回来了（用户撤销删除、或另存为回原路径）：允许下次缺失时再提示
+      missingNotifiedPath.current = null;
 
       const recorded = lastMeta.current;
       if (!recorded) return;
